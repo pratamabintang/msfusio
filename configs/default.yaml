@@ -1,0 +1,34 @@
+# Configuration for Landslide Segmentation (SAM2 Hiera RGB + ConvNeXt DTM)
+
+experiment:
+  name: "base"
+  seed: 42
+  runs_dir: "runs"
+
+dataset:
+  data_dir: "datasets/landslide"
+  modalities:
+    - "IMAGE"
+    - "DTM"
+  blacklist_path: "datasets/landslide/black_list.txt"
+  size: 512
+  batch_size: 4
+  num_workers: 4
+
+model:
+  hiera_path: "checkpoints/sam2_hiera_large.pt"
+  topo_backbone: "convnext_tiny"
+  pretrained_topo: true
+  use_kan: true
+  use_ssf: true
+
+training:
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.0005
+  min_lr: 1.0e-7
+  save_interval: 5
+  eval_interval: 1
+  amp: true
+  amp_dtype: "auto"
+  grad_clip: 1.0

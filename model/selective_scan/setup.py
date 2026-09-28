@@ -60,6 +60,12 @@ def get_ext():
     if bare_metal_version >= Version("11.8"):
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_90,code=sm_90")
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        target_flag = f"arch=compute_{major}{minor},code=sm_{major}{minor}"
+        if target_flag not in cc_flag:
+            cc_flag.append("-gencode")
+            cc_flag.append(target_flag)
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -98,6 +104,7 @@ def get_ext():
                         + ["--threads", "4"],
             },
             include_dirs=[Path(this_dir) / "csrc" / "selective_scan"],
+            extra_link_args=[f"-Wl,-rpath,{os.path.join(os.path.dirname(torch.__file__), 'lib')}"] if sys.platform.startswith("linux") else [],
         )
     )
 

@@ -1,0 +1,37 @@
+# Configuration for Landslide Segmentation using All Modalities
+
+experiment:
+  name: "sam2_convnext_multimodal_all"
+  seed: 1024
+  runs_dir: "runs"
+
+dataset:
+  data_dir: "datasets/landslide"
+  modalities:
+    - "IMAGE"
+    - "DTM"
+    - "SLOPE"
+    - "ASPECT_COS"
+    - "ASPECT_SIN"
+    - "HILLSHADE"
+  blacklist_path: "datasets/landslide/black_list.txt"
+  size: 352
+  batch_size: 12
+  num_workers: 4
+
+model:
+  hiera_path: "checkpoints/sam2_hiera_large.pt"
+  topo_backbone: "convnext_tiny"
+  pretrained_topo: true
+  use_kan: true
+
+training:
+  epochs: 20
+  lr: 0.001
+  weight_decay: 0.0005
+  min_lr: 1.0e-7
+  save_interval: 5
+  eval_interval: 1
+  amp: true
+  amp_dtype: "auto"
+  grad_clip: 1.0

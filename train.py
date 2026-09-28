@@ -21,19 +21,12 @@ logger = logging.getLogger(__name__)
 n_class   = "num_class"
 data_dir  = '....'
 model_dir = '....'
-augmentation_methods = [
-    RandomFlip(prob=0.5),
-    RandomCrop(crop_rate=0.1, prob=1.0), 
-    # RandomCropOut(crop_rate=0.2, prob=1.0),
-    # RandomBrightness(bright_range=0.15, prob=0.9),
-    # RandomNoise(noise_range=5, prob=0.9),
-]
+
 lr_start  = 0.01
 lr_decay  = 0.95
 
 
 def train(epo, model, train_loader, optimizer):
-
     lr_this_epo = lr_start * lr_decay**(epo-1)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr_this_epo
@@ -171,7 +164,6 @@ def test_fuse(model, test_loader):
 
 
 def main():
-
     model = eval(args.model_name)(n_class=n_class).to(args.device)
     # if args.device >= 0: model.to(args.device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr_start, momentum=0.9, weight_decay=0.0005) 
@@ -233,14 +225,13 @@ def main():
     os.rename(checkpoint_model_file, final_model_file)
 
 if __name__ == '__main__':
-
     parser = argparse.ArgumentParser(description='Train MFNet with pytorch')
     parser.add_argument('--model_name',  '-M',  type=str, default='MFNet')
     parser.add_argument('--batch_size',  '-B',  type=int, default=4)
-    parser.add_argument('--epoch_max' ,  '-E',  type=int, default=100)
+    parser.add_argument('--epoch_max' ,  '-E',  type=int, default=50)
     parser.add_argument('--epoch_from',  '-EF', type=int, default=1)
     parser.add_argument('--device',      '-G',  default='cuda')
-    parser.add_argument('--num_workers', '-j',  type=int, default=24)
+    parser.add_argument('--num_workers', '-j',  type=int, default=4)
     args = parser.parse_args()
 
     model_dir = os.path.join(model_dir, args.model_name)

@@ -4,13 +4,22 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-import selective_scan_cuda_core as selective_scan_cuda
+try:
+    import selective_scan_cuda_core as selective_scan_cuda
+except ImportError:
+    selective_scan_cuda = None
 
 
 class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
+    @torch.amp.custom_fwd(cast_inputs=torch.float32)
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1):
+        if selective_scan_cuda is None:
+            raise ImportError(
+                "selective_scan_cuda_core is not compiled or not found. "
+                "Compile it via 'cd selective_scan && pip install -e .'"
+            )
         # input_t: float, fp16, bf16; weight_t: float;
         # u, B, C, delta: input_t
         # D, delta_bias: float
@@ -47,6 +56,7 @@ class SelectiveScanFn(torch.autograd.Function):
         return out
 
     @staticmethod
+    @torch.amp.custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:

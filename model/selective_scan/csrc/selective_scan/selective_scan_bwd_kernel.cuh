@@ -239,7 +239,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             #pragma unroll
             for (int i = 0; i < kNItems; ++i) {
                 float delta_val = float(delta_vals_load[i]) + delta_bias;
-                float delta_val_neg_exp = expf(-delta_val);
+                float delta_clamped = fmaxf(delta_val, -80.0f);
+                float delta_val_neg_exp = expf(-delta_clamped);
                 ddelta_vals[i] = delta_val <= 20.f
                     ? ddelta_vals[i] / (1.f + delta_val_neg_exp)
                     : ddelta_vals[i];
