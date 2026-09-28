@@ -20,6 +20,8 @@ dataset:
   num_workers: 4
 
 model:
+  name: "MFNet"
+  num_classes: 2
   hiera_path: "checkpoints/sam2_hiera_large.pt"
   topo_backbone: "convnext_tiny"
   pretrained_topo: true

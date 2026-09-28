@@ -78,6 +78,9 @@ class LandslideDataset(Dataset):
         if not os.path.exists(image_dir):
             raise FileNotFoundError(f"IMAGE directory missing in {self.split_dir}")
 
+        label_dir = os.path.join(self.split_dir, "LABEL")
+        self.has_labels = os.path.exists(label_dir)
+
         all_files = sorted(os.listdir(image_dir))
         self.samples = []
         for f in all_files:
@@ -212,11 +215,14 @@ class LandslideDataset(Dataset):
 
     def _load_label(self, sample_name: str) -> torch.Tensor:
         """Loads ground truth binary landslide label mask as float tensor {0.0, 1.0}."""
+        if not self.has_labels:
+            return torch.zeros((1, self.target_size, self.target_size), dtype=torch.float32)
+
         label_path = os.path.join(self.split_dir, "LABEL", sample_name + ".png")
         if not os.path.exists(label_path):
             label_path = os.path.join(self.split_dir, "LABEL", sample_name + ".tif")
             if not os.path.exists(label_path):
-                raise FileNotFoundError(f"Label file not found for sample '{sample_name}'")
+                return torch.zeros((1, self.target_size, self.target_size), dtype=torch.float32)
 
         img = Image.open(label_path)
         arr = np.array(img)
@@ -321,4 +327,5 @@ class LandslideDataset(Dataset):
             "image": image_tensor,
             "label": label_tensor,
             "name": sample_name,
+            "has_label": self.has_labels,
         }

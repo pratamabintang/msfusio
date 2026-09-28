@@ -1,248 +1,541 @@
 # coding:utf-8
-import logging
-import os
 import argparse
+import logging
+import math
+import os
+import random
+import sys
 import time
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.utils.data import DataLoader
-
-from util.MF_dataset import MF_dataset
-from util.util import calculate_accuracy, calculate_result
-from util.augmentation import RandomFlip, RandomCrop, RandomCropOut, RandomBrightness, RandomNoise
-from model import MFNet, SegNet
 from tqdm import tqdm
-from util.loss import eeemodelLoss
-logger = logging.getLogger(__name__)
-# config
-n_class   = "num_class"
-data_dir  = '....'
-model_dir = '....'
+import yaml
 
-lr_start  = 0.01
-lr_decay  = 0.95
+from model import MFNet
+from util.landslide_dataset import LandslideDataset
+
+logger = logging.getLogger("MS2Fusion")
+
+def setup_logger(log_file: Optional[str] = None):
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
 
-def train(epo, model, train_loader, optimizer):
-    lr_this_epo = lr_start * lr_decay**(epo-1)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr_this_epo
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
 
-    loss_avg = 0.
-    acc_avg  = 0.
-    start_t = t = time.time()
+
+class LandslideLoss(nn.Module):
+    """
+    Combined Cross-Entropy and Dice loss for landslide segmentation.
+    Addresses extreme class imbalance between background and landslide areas.
+    """
+
+    def __init__(self, num_classes: int = 2, weight: Optional[torch.Tensor] = None, use_dice: bool = True):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ce = nn.CrossEntropyLoss(weight=weight)
+        self.use_dice = use_dice
+
+    def dice_loss(self, logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+        probs = F.softmax(logits, dim=1)
+        if self.num_classes == 2:
+            fg_prob = probs[:, 1]
+            fg_target = (targets == 1).float()
+            intersection = (fg_prob * fg_target).sum(dim=(1, 2))
+            union = fg_prob.sum(dim=(1, 2)) + fg_target.sum(dim=(1, 2))
+            dice = (2.0 * intersection + smooth) / (union + smooth)
+            return (1.0 - dice).mean()
+        else:
+            targets_one_hot = F.one_hot(
+                targets.clamp(0, self.num_classes - 1), num_classes=self.num_classes
+            ).permute(0, 3, 1, 2).float()
+            intersection = (probs * targets_one_hot).sum(dim=(2, 3))
+            union = probs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+            dice = (2.0 * intersection + smooth) / (union + smooth)
+            return (1.0 - dice.mean(dim=1)).mean()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = self.ce(logits, targets)
+        if self.use_dice and self.num_classes == 2:
+            d_loss = self.dice_loss(logits, targets)
+            return ce_loss + d_loss
+        return ce_loss
+
+
+def calculate_metrics(cf: np.ndarray) -> Dict[str, float]:
+    """Calculates accuracy, IoU per class, mean IoU, Precision, Recall, and F1/Dice."""
+    n_class = cf.shape[0]
+    total = cf.sum()
+    overall_acc = float(np.diag(cf).sum() / max(total, 1))
+
+    iou_list = []
+    for c in range(n_class):
+        intersection = cf[c, c]
+        union = cf[c, :].sum() + cf[:, c].sum() - intersection
+        iou = float(intersection / max(union, 1))
+        iou_list.append(iou)
+
+    metrics = {
+        "accuracy": overall_acc,
+        "iou_background": iou_list[0] if len(iou_list) > 0 else 0.0,
+        "iou_landslide": iou_list[1] if len(iou_list) > 1 else 0.0,
+        "mIoU": float(np.mean(iou_list)),
+    }
+
+    if n_class >= 2:
+        tp = cf[1, 1]
+        fp = cf[:, 1].sum() - tp
+        fn = cf[1, :].sum() - tp
+        precision = float(tp / max(tp + fp, 1))
+        recall = float(tp / max(tp + fn, 1))
+        f1 = float(2 * precision * recall / max(precision + recall, 1e-8))
+        metrics["precision"] = precision
+        metrics["recall"] = recall
+        metrics["f1_dice"] = f1
+
+    return metrics
+
+
+def train_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    scaler: Optional[torch.amp.GradScaler],
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    grad_clip: float,
+    epoch: int,
+    total_epochs: int,
+) -> Dict[str, float]:
     model.train()
-    pbar = enumerate(train_loader)
-    pbar=tqdm(pbar,total=len(train_loader), position = 0, leave= True)
-    logger.info(('\n' + '%10s' *3)%("epo", "loss" , "acc" ))
-    # SemanticRT loss
-    # train_criterion = eeemodelLoss().to(args.device)
+    total_loss = 0.0
+    correct_pixels = 0
+    total_pixels = 0
 
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{total_epochs:03d} [Train]", leave=False)
+    for batch in pbar:
+        if isinstance(batch, dict):
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+        else:
+            images, labels = batch[0].to(device), batch[1].to(device)
 
-    for it, (images, labels, names) in pbar:
-        images = Variable(images).to(args.device)
-        labels = Variable(labels).to(args.device)
-        # if args.gpu >= 0:
-        #     images = images.cuda(args.gpu)
-        #     labels = labels.cuda(args.gpu)
-        # print(torch.min(labels))
-        # print(torch.max(labels))
+        if labels.dim() == 4 and labels.shape[1] == 1:
+            labels = labels.squeeze(1).long()
+        else:
+            labels = labels.long()
+
         optimizer.zero_grad()
+
+        if amp_enabled and device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(images)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        loss_val = loss.item()
+        total_loss += loss_val
+
+        preds = logits.argmax(dim=1)
+        correct_pixels += (preds == labels).sum().item()
+        total_pixels += labels.numel()
+
+        pbar.set_postfix({"loss": f"{loss_val:.4f}", "acc": f"{correct_pixels / max(total_pixels, 1):.4f}"})
+
+    n_batches = len(train_loader)
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_acc = correct_pixels / max(total_pixels, 1)
+    return {"loss": avg_loss, "accuracy": avg_acc}
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    num_classes: int,
+    epoch: int,
+    total_epochs: int,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    cf = np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    pbar = tqdm(val_loader, desc=f"Epoch {epoch:03d}/{total_epochs:03d} [Val]", leave=False)
+    for batch in pbar:
+        if isinstance(batch, dict):
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+        else:
+            images, labels = batch[0].to(device), batch[1].to(device)
+
+        if labels.dim() == 4 and labels.shape[1] == 1:
+            labels = labels.squeeze(1).long()
+        else:
+            labels = labels.long()
+
         logits = model(images)
-        # logits =torch.sigmoid(logits)
-        # logits = torch.randn(4,13,640,640).to(args.device)
-        # labels = torch.randint(0,13,(4,640,640)).to(args.device)
-        loss = F.cross_entropy(logits, labels)
-        # print(loss)
-        # loss = train_criterion(logits, labels)
+        loss = criterion(logits, labels)
+        total_loss += loss.item()
 
-        loss.backward()
-        optimizer.step()
+        preds = logits.argmax(dim=1)
+        for c1 in range(num_classes):
+            for c2 in range(num_classes):
+                cf[c1, c2] += int(((labels == c1) & (preds == c2)).sum().item())
 
-        acc = calculate_accuracy(logits, labels)
-        loss_avg += float(loss)
-        acc_avg  += float(acc)
-
-        cur_t = time.time()
-        if cur_t-t > 5:
-            # print('|- epo %s/%s. train iter %s/%s. %.2f img/sec loss: %.4f, acc: %.4f' \
-            #     % (epo, args.epoch_max, it+1, train_loader.n_iter, (it+1)*args.batch_size/(cur_t-start_t), float(loss), float(acc)))
-            s = ('%10s'*2+'%10.4g'*2+'%10s')%(epo, args.epoch_max,float(loss), float(acc), images.shape)
-            pbar.set_description(s)
-            # t += 5
-
-    content = '\n | epo:%s/%s lr:%.4f train_loss_avg:%.4f train_acc_avg:%.4f ' \
-            % (epo, args.epoch_max, lr_this_epo, loss_avg/train_loader.n_iter, acc_avg/train_loader.n_iter)
-    print(content)
-    with open(log_file, 'a') as appender:
-        appender.write(content)
+    n_batches = len(val_loader)
+    metrics = calculate_metrics(cf)
+    metrics["loss"] = total_loss / max(n_batches, 1)
+    return metrics
 
 
-def validation(epo, model, val_loader):
-
-    loss_avg = 0.
-    acc_avg  = 0.
-    start_t = time.time()
-    model.eval()
-    pbar = enumerate(val_loader)
-    pbar = tqdm(pbar, total=len(val_loader),position = 0, leave= True)
-    logger.info(('\n' + '%10s' * 3) % ("epo", "loss", "acc"))
-    with torch.no_grad():
-        for it, (images, labels, names) in pbar:
-            images = Variable(images).to(args.device)
-            labels = Variable(labels).to(args.device)
-            # if args.gpu >= 0:
-            #     images = images.cuda(args.gpu)
-            #     labels = labels.cuda(args.gpu)
-
-            logits = model(images)
-            loss = F.cross_entropy(logits, labels)
-            acc = calculate_accuracy(logits, labels)
-            loss_avg += float(loss)
-            acc_avg  += float(acc)
-
-            cur_t = time.time()
-            # print('|- epo %s/%s. val iter %s/%s. %.2f img/sec loss: %.4f, acc: %.4f' \
-            #         % (epo, args.epoch_max, it+1, val_loader.n_iter, (it+1)*args.batch_size/(cur_t-start_t), float(loss), float(acc)))
-            s = ('%10s' * 2 + '%10.4g' * 2) % (epo, args.epoch_max, float(loss), float(acc))
-            pbar.set_description(s)
-    content = '\n | val_loss_avg:%.4f val_acc_avg:%.4f\n' \
-            % (loss_avg/val_loader.n_iter, acc_avg/val_loader.n_iter)
-    print(content)
-    with open(log_file, 'a') as appender:
-        appender.write(content)
+def load_config(config_path: str) -> Dict[str, Any]:
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg or {}
 
 
-def test_fuse(model, test_loader):
-    cf = np.zeros((n_class, n_class))
-
-    test_loader.n_iter = len(test_loader)
-
-    loss_avg = 0.
-    acc_avg = 0.
-    model.eval()
-    pbar = enumerate(test_loader)
-    pbar = tqdm(pbar, total=len(test_loader),position = 0, leave= True)
-    logger.info(('\n' + '%10s' * 3) % ("epo", "loss", "acc"))
-    with torch.no_grad():
-        for it, (images, labels, names) in pbar:
-            images = Variable(images)
-            labels = Variable(labels)
-            # if args.gpu >= 0:
-            images = images.to(args.device)
-            labels = labels.to(args.device)
-
-            logits = model(images)
-            loss = F.cross_entropy(logits, labels)
-            acc = calculate_accuracy(logits, labels)
-            loss_avg += float(loss)
-            acc_avg += float(acc)
-
-            s = ( '%10.4g' * 2) % (  float(loss), float(acc))
-            pbar.set_description(s)
-
-            predictions = logits.argmax(1)
-            for gtcid in range(n_class):
-                for pcid in range(n_class):
-                    gt_mask = labels == gtcid
-                    pred_mask = predictions == pcid
-                    intersection = gt_mask * pred_mask
-                    cf[gtcid, pcid] += int(intersection.sum())
-
-    overall_acc, acc, IoU = calculate_result(cf)
-
-    print('| overall accuracy:', overall_acc)
-    print('| accuracy of each class:', acc)
-    print('| class accuracy avg:', acc.mean())
-    print('| IoU:', IoU)
-    print('| class IoU avg:', IoU.mean())
-
-    return IoU.mean()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train MS2Fusion / MFNet for Landslide Segmentation")
+    parser.add_argument("--config", "-c", type=str, default="configs/default.yaml", help="Path to config YAML file")
+    parser.add_argument("--device", "-G", type=str, default=None, help="Device to use (e.g. cuda, cuda:0, cpu)")
+    parser.add_argument("--batch_size", "-B", type=int, default=None, help="Batch size override")
+    parser.add_argument("--epochs", "-E", type=int, default=None, help="Max epochs override")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--data_dir", type=str, default=None, help="Data directory override")
+    parser.add_argument("--runs_dir", type=str, default=None, help="Runs directory override")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Resume checkpoint path")
+    parser.add_argument("--model_name", "-M", type=str, default="MFNet", help="Model name")
+    parser.add_argument("--num_workers", "-j", type=int, default=None, help="Num workers override")
+    return parser.parse_args()
 
 
 def main():
-    model = eval(args.model_name)(n_class=n_class).to(args.device)
-    # if args.device >= 0: model.to(args.device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr_start, momentum=0.9, weight_decay=0.0005) 
-    # optimizer = torch.optim.Adam(model.parameters(), lr=lr_start)
+    args = parse_args()
 
-    if args.epoch_from > 1:
-        print('| loading checkpoint file %s... ' % checkpoint_model_file, end='')
-        model.load_state_dict(torch.load(checkpoint_model_file, map_location={'cuda:0'}))
-        optimizer.load_state_dict(torch.load(checkpoint_optim_file))
-        print('done!')
+    config_path = args.config
+    if not os.path.exists(config_path):
+        alt_path = os.path.join(os.path.dirname(__file__), config_path)
+        if os.path.exists(alt_path):
+            config_path = alt_path
+        else:
+            raise FileNotFoundError(f"Config file not found: {args.config}")
 
-    train_dataset = MF_dataset(data_dir, 'train', have_label=True)
-    val_dataset  = MF_dataset(data_dir, 'val', have_label=True)
-    test_dataset = MF_dataset(data_dir, 'test', have_label=True)
-    test_loader = DataLoader(
-        dataset=test_dataset,
-        batch_size=args.batch_size,
+    cfg = load_config(config_path)
+
+    # 1. Config sections with fallback defaults
+    exp_cfg = cfg.get("experiment", {})
+    ds_cfg = cfg.get("dataset", {})
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("training", {})
+
+    # CLI overrides
+    exp_name = exp_cfg.get("name", "base")
+    seed = int(exp_cfg.get("seed", 42))
+    runs_dir = args.runs_dir or exp_cfg.get("runs_dir", "runs")
+
+    data_dir = args.data_dir or ds_cfg.get("data_dir", "datasets/landslide")
+    modalities = ds_cfg.get("modalities", ["IMAGE", "DTM"])
+    blacklist_path = ds_cfg.get("blacklist_path", None)
+    img_size = int(ds_cfg.get("size", 512))
+    batch_size = args.batch_size or int(ds_cfg.get("batch_size", 4))
+    num_workers = args.num_workers if args.num_workers is not None else int(ds_cfg.get("num_workers", 4))
+
+    num_classes = int(model_cfg.get("num_classes", 2))
+    model_name = args.model_name or model_cfg.get("name", "MFNet")
+
+    epochs = args.epochs or int(train_cfg.get("epochs", 50))
+    lr = args.lr or float(train_cfg.get("lr", 0.0001))
+    weight_decay = float(train_cfg.get("weight_decay", 0.0005))
+    min_lr = float(train_cfg.get("min_lr", 1.0e-7))
+    save_interval = int(train_cfg.get("save_interval", 5))
+    eval_interval = int(train_cfg.get("eval_interval", 1))
+    amp_enabled = bool(train_cfg.get("amp", True))
+    amp_dtype_str = str(train_cfg.get("amp_dtype", "auto")).lower()
+    grad_clip = float(train_cfg.get("grad_clip", 1.0))
+
+    # Determine device
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Set random seed
+    set_seed(seed)
+
+    # 2. Output directory setup
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(runs_dir, f"{exp_name}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    # Setup logger
+    log_file = os.path.join(run_dir, "log.txt")
+    setup_logger(log_file)
+
+    logger.info("=" * 60)
+    logger.info("MS2Fusion / MFNet Landslide Segmentation Training")
+    logger.info("=" * 60)
+    logger.info(f"Config loaded from: {config_path}")
+    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Device: {device}")
+    logger.info(f"Modalities: {modalities}")
+    logger.info(f"Image size: {img_size}x{img_size}, Batch size: {batch_size}, Epochs: {epochs}")
+    logger.info(f"Learning rate: {lr} (min: {min_lr}), Weight decay: {weight_decay}")
+
+    # Save resolved config in run_dir for reproducibility and testing
+    resolved_config = {
+        "experiment": {
+            "name": exp_name,
+            "seed": seed,
+            "runs_dir": runs_dir,
+            "run_dir": run_dir,
+        },
+        "dataset": {
+            "data_dir": data_dir,
+            "modalities": modalities,
+            "blacklist_path": blacklist_path,
+            "size": img_size,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+        },
+        "model": {
+            "name": model_name,
+            "num_classes": num_classes,
+            **{k: v for k, v in model_cfg.items() if k not in ("name", "num_classes")},
+        },
+        "training": {
+            "epochs": epochs,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "min_lr": min_lr,
+            "save_interval": save_interval,
+            "eval_interval": eval_interval,
+            "amp": amp_enabled,
+            "amp_dtype": amp_dtype_str,
+            "grad_clip": grad_clip,
+        },
+    }
+    with open(os.path.join(run_dir, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(resolved_config, f, sort_keys=False)
+
+    # 3. Datasets & DataLoaders
+    train_dataset = LandslideDataset(
+        data_dir=data_dir,
+        split="train",
+        size=img_size,
+        modalities=modalities,
+        blacklist_path=blacklist_path,
+        mode="train",
+    )
+    val_dataset = LandslideDataset(
+        data_dir=data_dir,
+        split="val",
+        size=img_size,
+        modalities=modalities,
+        blacklist_path=blacklist_path,
+        mode="val",
+    )
+
+    pin_mem = device.type == "cuda"
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_mem,
+        drop_last=True if len(train_dataset) > batch_size else False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False
+        num_workers=num_workers,
+        pin_memory=pin_mem,
+        drop_last=False,
     )
 
-    train_loader  = DataLoader(
-        dataset     = train_dataset,
-        batch_size  = args.batch_size,
-        shuffle     = True,
-        num_workers = 0,
-        pin_memory  = True,
-        drop_last   = True
-    )
-    val_loader  = DataLoader(
-        dataset     = val_dataset,
-        batch_size  = args.batch_size,
-        shuffle     = False,
-        num_workers = 0,
-        pin_memory  = True,
-        drop_last   = False
-    )
-    train_loader.n_iter = len(train_loader)
-    val_loader.n_iter   = len(val_loader)
-    best_IoU =0
-    for epo in tqdm(range(args.epoch_from, args.epoch_max+1)):
-        print('\n| epo #%s begin...' % epo)
+    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-        train(epo, model, train_loader, optimizer)
-        validation(epo, model, val_loader)
-        IoU = test_fuse(model, test_loader)
-        if best_IoU < IoU:
-            best_IoU = IoU
-            torch.save(model.state_dict(), '......pth')
-            torch.save(optimizer.state_dict(), '.......optim')
-        # save check point model
-        print('| saving check point model file... ', end='')
-        torch.save(model.state_dict(), checkpoint_model_file)
-        torch.save(optimizer.state_dict(), checkpoint_optim_file)
-        print('done!')
+    # 4. Model setup
+    # Calculate auxiliary (non-RGB) channels from modalities
+    non_rgb_modalities = [m for m in modalities if m != "IMAGE"]
+    in_channels_inf = len(non_rgb_modalities)
 
-    os.rename(checkpoint_model_file, final_model_file)
+    logger.info(f"Initializing {model_name} (in_channels_inf={in_channels_inf}, num_classes={num_classes})...")
+    model = MFNet(n_class=num_classes, in_channels_inf=in_channels_inf)
+    model.to(device)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train MFNet with pytorch')
-    parser.add_argument('--model_name',  '-M',  type=str, default='MFNet')
-    parser.add_argument('--batch_size',  '-B',  type=int, default=4)
-    parser.add_argument('--epoch_max' ,  '-E',  type=int, default=50)
-    parser.add_argument('--epoch_from',  '-EF', type=int, default=1)
-    parser.add_argument('--device',      '-G',  default='cuda')
-    parser.add_argument('--num_workers', '-j',  type=int, default=4)
-    args = parser.parse_args()
+    # Resume checkpoint if provided
+    start_epoch = 1
+    best_iou = 0.0
+    if args.checkpoint and os.path.isfile(args.checkpoint):
+        logger.info(f"Loading checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+        # Handle DataParallel 'module.' prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        if isinstance(ckpt, dict) and "epoch" in ckpt:
+            start_epoch = ckpt["epoch"] + 1
+        if isinstance(ckpt, dict) and "best_iou" in ckpt:
+            best_iou = float(ckpt["best_iou"])
+        logger.info(f"Checkpoint loaded. Resuming from epoch {start_epoch}.")
 
-    model_dir = os.path.join(model_dir, args.model_name)
-    os.makedirs(model_dir, exist_ok=True)
-    checkpoint_model_file = os.path.join(model_dir, 'tmp.pth')
-    checkpoint_optim_file = os.path.join(model_dir, 'tmp.optim')
-    final_model_file      = os.path.join(model_dir, 'final.pth')
-    log_file              = os.path.join(model_dir, 'log.txt')
+    # 5. Optimizer, Scheduler, Loss, AMP
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
 
-    # print('| training %s on GPU #%d with pytorch' % (args.model_name, args.device))
-    print('| from epoch %d / %s' % (args.epoch_from, args.epoch_max))
-    print('| model will be saved in: %s' % model_dir)
+    criterion = LandslideLoss(num_classes=num_classes, use_dice=True)
 
+    if amp_dtype_str == "bfloat16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and device.type == "cuda")
+
+    # 6. Training Loop
+    logger.info("Starting training loop...")
+    for epoch in range(start_epoch, epochs + 1):
+        epoch_start_time = time.time()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        train_res = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            grad_clip=grad_clip,
+            epoch=epoch,
+            total_epochs=epochs,
+        )
+        scheduler.step()
+
+        elapsed = time.time() - epoch_start_time
+        logger.info(
+            f"Epoch [{epoch:03d}/{epochs:03d}] lr: {current_lr:.6f} | "
+            f"Train Loss: {train_res['loss']:.4f} Acc: {train_res['accuracy']:.4f} | Time: {elapsed:.1f}s"
+        )
+
+        # Validation
+        if epoch % eval_interval == 0 or epoch == epochs:
+            val_res = validate(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                num_classes=num_classes,
+                epoch=epoch,
+                total_epochs=epochs,
+            )
+
+            val_iou = val_res.get("iou_landslide", val_res.get("mIoU", 0.0))
+            is_best = val_iou > best_iou
+            if is_best:
+                best_iou = val_iou
+
+            logger.info(
+                f"   [Val Eval] Loss: {val_res['loss']:.4f} | "
+                f"mIoU: {val_res['mIoU']:.4f} | Landslide IoU: {val_res['iou_landslide']:.4f} | "
+                f"F1/Dice: {val_res.get('f1_dice', 0.0):.4f} | Acc: {val_res['accuracy']:.4f}"
+                + (" (NEW BEST!)" if is_best else "")
+            )
+
+            # Save best checkpoint
+            if is_best:
+                best_ckpt_path = os.path.join(checkpoints_dir, "best.pth")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "best_iou": best_iou,
+                        "val_metrics": val_res,
+                        "config": resolved_config,
+                    },
+                    best_ckpt_path,
+                )
+                logger.info(f"Saved best model checkpoint to: {best_ckpt_path}")
+
+        # Save interval checkpoint
+        if epoch % save_interval == 0 or epoch == epochs:
+            interval_ckpt_path = os.path.join(checkpoints_dir, f"epoch_{epoch}.pth")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": resolved_config,
+                },
+                interval_ckpt_path,
+            )
+
+        # Always save last checkpoint
+        last_ckpt_path = os.path.join(checkpoints_dir, "last.pth")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best_iou": best_iou,
+                "config": resolved_config,
+            },
+            last_ckpt_path,
+        )
+
+    logger.info("=" * 60)
+    logger.info(f"Training completed! Best Validation IoU: {best_iou:.4f}")
+    logger.info(f"Checkpoints directory: {checkpoints_dir}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
     main()

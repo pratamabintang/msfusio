@@ -30,15 +30,26 @@ except:
 
 # an alternative for mamba_ssm
 try:
-    from model.selective_scan.selective_scan.selective_scan_interface import selective_scan_fn as selective_scan_fn_v1
+    from model.selective_scan.selective_scan.selective_scan_interface import (
+        selective_scan_fn as selective_scan_fn_v1,
+        selective_scan_ref,
+    )
 except:
     pass
 
 # cross selective scan ===============================
-if True:
+try:
     import selective_scan_cuda_core as selective_scan_cuda
+except ImportError:
+    selective_scan_cuda = None
+
+def selective_scan_core(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
+    if selective_scan_cuda is None:
+        return selective_scan_ref(u, delta, A, B, C, D, delta_bias, delta_softplus)
+    return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
 
+if True:
     class SelectiveScan(torch.autograd.Function):
         # @staticmethod
         @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
@@ -222,14 +233,14 @@ if True:
 
         # to enable fvcore.nn.jit_analysis: inputs[i].debugName
         def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
-            return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
+            return selective_scan_core(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
         ys: torch.Tensor = selective_scan(
             xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus, nrows,
         ).view(B, K, -1, H, W)
 
         y = CrossMerge.apply(ys)
-        y=y.half()
+        y = y.to(x.dtype)
         if softmax_version:
             y = y.softmax(y, dim=-1).to(x.dtype)
             y = y.transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1)
@@ -294,7 +305,7 @@ if True:
 
         # to enable fvcore.nn.jit_analysis: inputs[i].debugName
         def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
-            return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
+            return selective_scan_core(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
         ys: torch.Tensor = selective_scan(
             xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus, nrows,
@@ -362,7 +373,7 @@ if True:
 
         # to enable fvcore.nn.jit_analysis: inputs[i].debugName
         def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
-            return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
+            return selective_scan_core(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
         ys: torch.Tensor = selective_scan(
             x_fuse, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus, nrows,
@@ -429,7 +440,7 @@ if True:
 
         # to enable fvcore.nn.jit_analysis: inputs[i].debugName
         def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True, nrows=1):
-            return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
+            return selective_scan_core(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
         ys: torch.Tensor = selective_scan(
             x_fuse, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus, nrows,
@@ -1521,8 +1532,9 @@ class MiniInception(nn.Module):
 
 class MFNet(nn.Module):
 
-    def __init__(self, n_class):
+    def __init__(self, n_class, in_channels_inf=1, **kwargs):
         super(MFNet, self).__init__()
+        self.in_channels_inf = in_channels_inf
         rgb_ch = [16,48,48,96,96]
         inf_ch = [16,48,48,96,96]
         # inf_ch =[16,16,16,36,36]
@@ -1534,7 +1546,7 @@ class MFNet(nn.Module):
         self.conv4_rgb   = MiniInception(rgb_ch[2], rgb_ch[3])
         self.conv5_rgb   = MiniInception(rgb_ch[3], rgb_ch[4])
 
-        self.conv1_inf   = ConvBnLeakyRelu2d(1, inf_ch[0])
+        self.conv1_inf   = ConvBnLeakyRelu2d(max(1, in_channels_inf), inf_ch[0])
         self.conv2_1_inf = ConvBnLeakyRelu2d(inf_ch[0], inf_ch[1])
         self.conv2_2_inf = ConvBnLeakyRelu2d(inf_ch[1], inf_ch[1])
         self.conv3_1_inf = ConvBnLeakyRelu2d(inf_ch[1], inf_ch[2])
@@ -1552,7 +1564,10 @@ class MFNet(nn.Module):
     def forward(self, x):
         # split data into RGB and INF
         x_rgb = x[:,:3]
-        x_inf = x[:,3:]
+        if x.shape[1] > 3:
+            x_inf = x[:,3:]
+        else:
+            x_inf = torch.zeros((x.shape[0], max(1, self.in_channels_inf), x.shape[2], x.shape[3]), device=x.device, dtype=x.dtype)
 
         # encode
         x_rgb    = self.conv1_rgb(x_rgb)
@@ -1587,13 +1602,13 @@ class MFNet(nn.Module):
 
         # decode
 
-        x = F.upsample(x, scale_factor=2, mode='nearest') # unpool4
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool4
         x = self.decode4(x + torch.cat((x_rgb_p4, x_inf_p4), dim=1))
-        x = F.upsample(x, scale_factor=2, mode='nearest') # unpool3
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool3
         x = self.decode3(x + torch.cat((x_rgb_p3, x_inf_p3), dim=1))
-        x = F.upsample(x, scale_factor=2, mode='nearest') # unpool2
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool2
         x = self.decode2(x + torch.cat((x_rgb_p2, x_inf_p2), dim=1))
-        x = F.upsample(x, scale_factor=2, mode='nearest') # unpool1
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool1
         x = self.decode1(x)
 
         return x

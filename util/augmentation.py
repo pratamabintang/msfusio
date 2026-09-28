@@ -1,7 +1,9 @@
 # coding:utf-8
 import numpy as np
-from PIL import Image
-from ipdb import set_trace as st
+try:
+    from ipdb import set_trace as st
+except ImportError:
+    st = None
 
 
 class RandomFlip():

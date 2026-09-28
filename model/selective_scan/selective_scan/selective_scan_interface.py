@@ -10,10 +10,18 @@ except ImportError:
     selective_scan_cuda = None
 
 
+try:
+    custom_fwd = torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
+    custom_bwd = torch.amp.custom_bwd(device_type='cuda')
+except (TypeError, AttributeError):
+    custom_fwd = torch.amp.custom_fwd(cast_inputs=torch.float32)
+    custom_bwd = torch.amp.custom_bwd
+
+
 class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
-    @torch.amp.custom_fwd(cast_inputs=torch.float32)
+    @custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1):
         if selective_scan_cuda is None:
             raise ImportError(
@@ -56,7 +64,7 @@ class SelectiveScanFn(torch.autograd.Function):
         return out
 
     @staticmethod
-    @torch.amp.custom_bwd
+    @custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         if dout.stride(-1) != 1:
@@ -90,6 +98,8 @@ def selective_scan_fn(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
+    if selective_scan_cuda is None:
+        return selective_scan_ref(u, delta, A, B, C, D, delta_bias, delta_softplus)
     return SelectiveScanFn.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows)
 
 
