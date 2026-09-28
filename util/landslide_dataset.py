@@ -14,10 +14,19 @@ import cv2
 
 def load_blacklist(blacklist_path: Optional[str]) -> set:
     """Loads sample identifiers to ignore from a blacklist text file."""
-    if not blacklist_path or not os.path.exists(blacklist_path):
+    if not blacklist_path or str(blacklist_path).strip().lower() in ("none", "null", ""):
         return set()
+    if not os.path.exists(blacklist_path):
+        return set()
+    blacklist = set()
     with open(blacklist_path, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
+        for line in f:
+            clean_line = line.strip()
+            if clean_line and not clean_line.startswith("#"):
+                stem, _ = os.path.splitext(clean_line)
+                blacklist.add(clean_line)
+                blacklist.add(stem)
+    return blacklist
 
 
 class LandslideDataset(Dataset):
@@ -85,7 +94,7 @@ class LandslideDataset(Dataset):
         self.samples = []
         for f in all_files:
             base_name, _ = os.path.splitext(f)
-            if base_name in self.blacklist:
+            if base_name in self.blacklist or f in self.blacklist:
                 continue
             self.samples.append(base_name)
 
@@ -171,12 +180,11 @@ class LandslideDataset(Dataset):
             return tensor
 
         arr = np.array(img, dtype=np.float32)
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
         if modality == "DTM":
             # Per-tile Min-Max Normalization: captures relative local topography
-            if np.isnan(arr).any() or np.isinf(arr).any():
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
             valid_mask = (arr > -1000.0) & (arr < 10000.0)
             if valid_mask.any():
                 val_min = float(arr[valid_mask].min())
@@ -191,22 +199,26 @@ class LandslideDataset(Dataset):
             return torch.from_numpy(norm_arr).unsqueeze(0)  # Shape (1, H, W)
 
         elif modality == "SLOPE":
-            # Slope in degrees [0, 90] -> scale to [0, 1]
+            # Slope in degrees [0, 90] -> scale to [0, 1], filter negative NoData
+            arr = np.where(arr < 0.0, 0.0, arr)
             norm_arr = np.clip(arr / 90.0, 0.0, 1.0)
             return torch.from_numpy(norm_arr).unsqueeze(0)
 
         elif modality == "ASPECT":
-            # Aspect in degrees [0, 360] -> scale to [0, 1]
+            # Aspect in degrees [0, 360] -> scale to [0, 1], filter negative NoData
+            arr = np.where(arr < 0.0, 0.0, arr)
             norm_arr = np.clip(arr / 360.0, 0.0, 1.0)
             return torch.from_numpy(norm_arr).unsqueeze(0)
 
         elif modality in ("ASPECT_COS", "ASPECT_SIN"):
-            # Cyclical components already in [-1.0, 1.0]
+            # Cyclical components in [-1.0, 1.0]
             norm_arr = np.clip(arr, -1.0, 1.0)
+            norm_arr = np.nan_to_num(norm_arr, nan=0.0)
             return torch.from_numpy(norm_arr).unsqueeze(0)
 
         elif modality == "HILLSHADE":
-            # Topographic illumination already in [0.0, 1.0]
+            # Topographic illumination in [0.0, 1.0], filter negative NoData
+            arr = np.where(arr < 0.0, 0.0, arr)
             norm_arr = np.clip(arr, 0.0, 1.0)
             return torch.from_numpy(norm_arr).unsqueeze(0)
 
@@ -226,6 +238,8 @@ class LandslideDataset(Dataset):
 
         img = Image.open(label_path)
         arr = np.array(img)
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         # Landslide is 255 (or > 0), background is 0
         bin_arr = (arr > 0).astype(np.float32)
         return torch.from_numpy(bin_arr).unsqueeze(0)  # Shape (1, H, W)

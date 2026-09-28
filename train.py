@@ -48,7 +48,7 @@ def set_seed(seed: int = 42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
 
 
 class LandslideLoss(nn.Module):
@@ -144,22 +144,29 @@ def train_epoch(
     pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{total_epochs:03d} [Train]", leave=False)
     for batch in pbar:
         if isinstance(batch, dict):
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
         else:
-            images, labels = batch[0].to(device), batch[1].to(device)
+            images, labels = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
 
         if labels.dim() == 4 and labels.shape[1] == 1:
             labels = labels.squeeze(1).long()
         else:
             labels = labels.long()
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         if amp_enabled and device.type == "cuda":
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(images)
                 loss = criterion(logits, labels)
+
+            loss_val = loss.item()
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                logger.warning(f"Epoch {epoch:03d} encountered NaN/Inf loss ({loss_val})! Skipping step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -169,12 +176,17 @@ def train_epoch(
         else:
             logits = model(images)
             loss = criterion(logits, labels)
+
+            loss_val = loss.item()
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                logger.warning(f"Epoch {epoch:03d} encountered NaN/Inf loss ({loss_val})! Skipping step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-
-        loss_val = loss.item()
         total_loss += loss_val
 
         preds = logits.argmax(dim=1)
@@ -198,6 +210,8 @@ def validate(
     num_classes: int,
     epoch: int,
     total_epochs: int,
+    amp_enabled: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -206,24 +220,31 @@ def validate(
     pbar = tqdm(val_loader, desc=f"Epoch {epoch:03d}/{total_epochs:03d} [Val]", leave=False)
     for batch in pbar:
         if isinstance(batch, dict):
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
         else:
-            images, labels = batch[0].to(device), batch[1].to(device)
+            images, labels = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
 
         if labels.dim() == 4 and labels.shape[1] == 1:
             labels = labels.squeeze(1).long()
         else:
             labels = labels.long()
 
-        logits = model(images)
-        loss = criterion(logits, labels)
+        if amp_enabled and device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                logits = model(images)
+                loss = criterion(logits, labels)
+        else:
+            logits = model(images)
+            loss = criterion(logits, labels)
+
         total_loss += loss.item()
 
         preds = logits.argmax(dim=1)
-        for c1 in range(num_classes):
-            for c2 in range(num_classes):
-                cf[c1, c2] += int(((labels == c1) & (preds == c2)).sum().item())
+        # Vectorized confusion matrix on GPU/device without per-cell synchronization
+        flat_mask = (labels * num_classes + preds).view(-1)
+        batch_cf = torch.bincount(flat_mask, minlength=num_classes ** 2).view(num_classes, num_classes)
+        cf += batch_cf.cpu().numpy()
 
     n_batches = len(val_loader)
     metrics = calculate_metrics(cf)
@@ -381,21 +402,26 @@ def main():
     )
 
     pin_mem = device.type == "cuda"
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_mem,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_mem,
         drop_last=True if len(train_dataset) > batch_size else False,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_mem,
         drop_last=False,
+        **loader_kwargs,
     )
 
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
@@ -475,6 +501,8 @@ def main():
                 num_classes=num_classes,
                 epoch=epoch,
                 total_epochs=epochs,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
             )
 
             val_iou = val_res.get("iou_landslide", val_res.get("mIoU", 0.0))

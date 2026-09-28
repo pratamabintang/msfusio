@@ -157,6 +157,9 @@ def main():
     logger.info(f"Device: {device}")
     logger.info(f"Modalities: {modalities}")
 
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
     # 1. Dataset & DataLoader
     dataset = LandslideDataset(
         data_dir=data_dir,
@@ -166,13 +169,21 @@ def main():
         blacklist_path=blacklist_path,
         mode="test",
     )
+    pin_mem = device.type == "cuda"
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_mem,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
     data_loader = DataLoader(
         dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
         drop_last=False,
+        **loader_kwargs,
     )
     logger.info(f"Total test samples: {len(dataset)}")
 
@@ -210,16 +221,17 @@ def main():
 
     logger.info("Running inference...")
     start_time = time.time()
+    amp_enabled = (device.type == "cuda")
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=f"Testing [{args.split}]", leave=True):
             if isinstance(batch, dict):
-                images = batch["image"].to(device)
-                labels = batch["label"].to(device)
+                images = batch["image"].to(device, non_blocking=True)
+                labels = batch["label"].to(device, non_blocking=True)
                 names = batch["name"]
                 has_label_flag = bool(batch.get("has_label", [True])[0])
             else:
-                images, labels, names = batch[0].to(device), batch[1].to(device), batch[2]
+                images, labels, names = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True), batch[2]
                 has_label_flag = True
 
             if labels.dim() == 4 and labels.shape[1] == 1:
@@ -227,7 +239,11 @@ def main():
             else:
                 labels = labels.long()
 
-            logits = model(images)
+            if amp_enabled:
+                with torch.amp.autocast(device_type="cuda"):
+                    logits = model(images)
+            else:
+                logits = model(images)
 
             if num_classes == 2:
                 probs = F.softmax(logits, dim=1)[:, 1]
@@ -236,11 +252,11 @@ def main():
                 preds = logits.argmax(dim=1)
 
             # Confusion matrix accumulation if ground truth is present
-            if has_label_flag and (labels > 0).any() or (labels == 0).any():
+            if has_label_flag and ((labels > 0).any() or (labels == 0).any()):
                 has_any_labels = True
-                for c1 in range(num_classes):
-                    for c2 in range(num_classes):
-                        cf[c1, c2] += int(((labels == c1) & (preds == c2)).sum().item())
+                flat_mask = (labels * num_classes + preds).view(-1)
+                batch_cf = torch.bincount(flat_mask, minlength=num_classes ** 2).view(num_classes, num_classes)
+                cf += batch_cf.cpu().numpy()
 
             # Save prediction masks
             if args.save_masks:

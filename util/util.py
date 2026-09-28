@@ -30,16 +30,25 @@ def calculate_accuracy(logits, labels):
 #     return overall_acc, acc, IoU
 def calculate_result(cf):
     n_class = cf.shape[0]
-    conf = np.zeros((n_class,n_class))
+    conf = np.zeros((n_class, n_class))
     IoU = np.zeros(n_class)
-    start_index=1
-    conf[:,0] = cf[:,0]/cf[:,0].sum()
-    IoU[0]=cf[0,0]/(cf[0,0:].sum()+cf[0:,0].sum()-cf[0,0])
-    for cid in range(start_index,n_class):
-        if cf[:,cid].sum() > 0:
-            conf[:,cid] = cf[:,cid]/cf[:,cid].sum()
-            IoU[cid]  = cf[cid,cid]/(cf[cid,start_index:].sum()+cf[start_index:,cid].sum()-cf[cid,cid])
-    overall_acc = np.diag(cf[1:,1:]).sum()/cf[1:,:].sum()
+    start_index = 1
+
+    col_sum_0 = cf[:, 0].sum()
+    if col_sum_0 > 0:
+        conf[:, 0] = cf[:, 0] / col_sum_0
+    u0 = cf[0, :].sum() + cf[:, 0].sum() - cf[0, 0]
+    IoU[0] = cf[0, 0] / max(u0, 1e-8)
+
+    for cid in range(start_index, n_class):
+        cid_col_sum = cf[:, cid].sum()
+        if cid_col_sum > 0:
+            conf[:, cid] = cf[:, cid] / cid_col_sum
+        u_cid = cf[cid, :].sum() + cf[:, cid].sum() - cf[cid, cid]
+        IoU[cid] = cf[cid, cid] / max(u_cid, 1e-8)
+
+    fg_sum = cf[1:, :].sum()
+    overall_acc = float(np.diag(cf[1:, 1:]).sum() / max(fg_sum, 1e-8)) if fg_sum > 0 else 0.0
     acc = np.diag(conf)
 
     return overall_acc, acc, IoU

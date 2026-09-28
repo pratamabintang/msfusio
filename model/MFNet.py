@@ -242,7 +242,7 @@ if True:
         y = CrossMerge.apply(ys)
         y = y.to(x.dtype)
         if softmax_version:
-            y = y.softmax(y, dim=-1).to(x.dtype)
+            y = F.softmax(y, dim=-1).to(x.dtype)
             y = y.transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         else:
             y = y.transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1)
@@ -314,7 +314,7 @@ if True:
         y = CrossMerge.apply(ys)
 
         if softmax_version:
-            y = y.softmax(y, dim=-1).to(x.dtype)
+            y = F.softmax(y, dim=-1).to(x.dtype)
             y = ys[:, 0].transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         else:
             y = ys[:, 0].transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1)
